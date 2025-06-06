@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { vapi, startAssistant, stopAssistant } from "./ai";
 import ActiveCallDetails from "./call/ActiveCallDetails";
 import Chatbox from "./components/Chatbox";
+import AssistantTools from './components/AssistantTools';
 
 function App() {
   const [started, setStarted] = useState(false);
@@ -77,6 +78,8 @@ function App() {
     {showForm && (
       <>
         <Chatbox />
+
+
         {/*
         <h1>Contact Details (Required)</h1>
         <input

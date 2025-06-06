@@ -1,23 +1,111 @@
 import os
+import re
+import sqlite3
 import uuid
 import requests
+from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from datetime import datetime
+from dotenv import load_dotenv
 from gtts import gTTS
 import threading
+import time
 
+# Load API key từ .env
+load_dotenv()
+api_key = os.getenv("OPENROUTER_API_KEY")
+
+# Flask app
 app = Flask(__name__)
 CORS(app)
 
-# Thư mục chứa file âm thanh
+# Cấu hình database
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///appointments.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Định nghĩa model lịch hẹn
+class Appointment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    datetime = db.Column(db.DateTime, nullable=False)
+    description = db.Column(db.String(255), nullable=False)
+    notified = db.Column(db.Boolean, default=False)
+
+# Tạo thư mục audio
 AUDIO_FOLDER = "static/audio"
 os.makedirs(AUDIO_FOLDER, exist_ok=True)
 
-# Hàm tự động xóa file âm thanh sau 10 phút
+# Ghi chú, công việc, lịch hẹn dạng tạm (có thể thay bằng DB nếu muốn)
+notes = []
+tasks = []
+appointments = []
+
+# Tạo bảng (chạy 1 lần)
+with app.app_context():
+    db.create_all()
+
+def parse_reminder(text):
+    text = text.lower().strip()
+
+    # 1. Dạng "nhắc tôi ... trong X giây/phút/giờ/ngày nữa"
+    pattern_relative = re.compile(r'nhắc(?: tôi)? (.+?) trong (\d+) (giây|phút|giờ|ngày) nữa')
+    m_rel = pattern_relative.search(text)
+    if m_rel:
+        note = 'Nhắc nhở ' + m_rel.group(1).strip()
+        number = int(m_rel.group(2))
+        unit = m_rel.group(3)
+
+        now = datetime.now()
+        if unit == 'giây':
+            remind_time = now + timedelta(seconds=number)
+        elif unit == 'phút':
+            remind_time = now + timedelta(minutes=number)
+        elif unit == 'giờ':
+            remind_time = now + timedelta(hours=number)
+        elif unit == 'ngày':
+            remind_time = now + timedelta(days=number)
+        else:
+            return None, None
+
+        return remind_time, note
+
+    # 2. Dạng "tạo nhắc nhở vào lúc 10:40 ngày 6/6/2025"
+    match = re.search(r'lúc (\d{1,2}[:h]\d{2}) ngày (\d{1,2})[/-](\d{1,2})[/-](\d{4})', text)
+    if match:
+        time_str = match.group(1).replace('h', ':')
+        day = int(match.group(2))
+        month = int(match.group(3))
+        year = int(match.group(4))
+        try:
+            dt = datetime.strptime(f"{day:02}/{month:02}/{year} {time_str}", "%d/%m/%Y %H:%M")
+            note = 'Nhắc nhở ' + text
+            return dt, note
+        except ValueError:
+            return None, None
+
+    # 3. Dạng "nhắc tôi/nhắc nhở <nội dung> vào HH:mm [ngày] dd/mm/yyyy"
+    match2 = re.search(
+        r'nhắc (?:tôi|nhở) (.+) vào (\d{1,2}:\d{2}) ?(?:ngày )?(\d{1,2})[/-](\d{1,2})[/-](\d{4})', text)
+    if match2:
+        note = 'Nhắc nhở ' + match2.group(1).strip()
+        time_str = match2.group(2)
+        day = int(match2.group(3))
+        month = int(match2.group(4))
+        year = int(match2.group(5))
+        try:
+            dt = datetime.strptime(f"{day:02}/{month:02}/{year} {time_str}", "%d/%m/%Y %H:%M")
+            return dt, note
+        except ValueError:
+            return None, None
+
+
+    return None, None
+
+
+# Tự động xóa file âm thanh sau X phút
 def auto_delete_file(path, delay_minutes=10):
     def delete():
-        import time
         time.sleep(delay_minutes * 60)
         try:
             if os.path.exists(path):
@@ -36,7 +124,26 @@ def chat_endpoint():
 
         now = datetime.now()
 
-        # Các câu trả lời đặc biệt
+        # Tạo nhắc nhở thông minh
+        dt, content = parse_reminder(user_message)
+        if dt:
+            new_appt = Appointment(datetime=dt, description=content)
+            db.session.add(new_appt)
+            db.session.commit()
+
+            reply = f"✅ Đã tạo nhắc nhở lúc {dt.strftime('%H:%M %d/%m/%Y')}"
+            tts = gTTS(text=reply, lang="vi", tld="com.vn")
+            filename = f"{uuid.uuid4()}.mp3"
+            filepath = os.path.join(AUDIO_FOLDER, filename)
+            tts.save(filepath)
+            auto_delete_file(filepath)
+
+            return jsonify({
+                "reply": reply,
+                "audio_url": f"/static/audio/{filename}"
+            })
+
+        # Các câu hỏi đặc biệt
         if "mấy giờ" in user_message or "bây giờ là mấy giờ" in user_message:
             reply = f"Bây giờ là {now.strftime('%H:%M:%S')}"
         elif "ngày mấy" in user_message or "hôm nay là ngày mấy" in user_message:
@@ -48,9 +155,9 @@ def chat_endpoint():
         elif "mở facebook" in user_message:
             return jsonify({"reply": "Đây là Facebook!", "open_url": "https://www.facebook.com"})
         else:
-            # Gửi câu hỏi lên OpenRouter (OpenAI GPT-3.5 Turbo)
+            # Gửi tới OpenRouter
             headers = {
-                "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             }
             payload = {
@@ -68,22 +175,16 @@ def chat_endpoint():
                 ]
             }
 
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json=payload,
-                headers=headers
-            )
+            response = requests.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
             reply = data["choices"][0]["message"]["content"]
 
-        # Tạo file âm thanh từ câu trả lời
-        tts = gTTS(text=reply, lang="vi",tld="com.vn")
+        # Tạo âm thanh phản hồi
+        tts = gTTS(text=reply, lang="vi", tld="com.vn")
         filename = f"{uuid.uuid4()}.mp3"
         filepath = os.path.join(AUDIO_FOLDER, filename)
         tts.save(filepath)
-
-        # Khởi chạy xóa file sau 10 phút
         auto_delete_file(filepath)
 
         return jsonify({
@@ -95,10 +196,101 @@ def chat_endpoint():
         print("Lỗi:", str(e))
         return jsonify({"reply": "Xin lỗi, có lỗi xảy ra", "error": str(e)}), 500
 
-# Endpoint trả file audio .mp3 cho client
 @app.route("/static/audio/<filename>")
 def serve_audio(filename):
     return send_from_directory(AUDIO_FOLDER, filename)
+
+@app.route('/note', methods=['POST'])
+def create_note():
+    data = request.json
+    note = {
+        'id': len(notes) + 1,
+        'content': data['content'],
+        'created_at': datetime.now().isoformat()
+    }
+    notes.append(note)
+    return jsonify(note), 201
+
+@app.route('/note', methods=['GET'])
+def get_notes():
+    return jsonify(notes)
+
+@app.route('/task', methods=['POST'])
+def create_task():
+    data = request.json
+    task = {
+        'id': len(tasks) + 1,
+        'task': data['task'],
+        'remind_time': data['remind_time']
+    }
+    tasks.append(task)
+    return jsonify(task), 201
+
+@app.route('/task', methods=['GET'])
+def get_tasks():
+    return jsonify(tasks)
+
+@app.route('/appointment', methods=['POST'])
+def create_appointment():
+    data = request.json
+    appointment = {
+        'id': len(appointments) + 1,
+        'title': data['title'],
+        'date': data['date'],
+        'time': data['time'],
+        'location': data['location']
+    }
+    appointments.append(appointment)
+    return jsonify(appointment), 201
+
+@app.route('/appointment', methods=['GET'])
+def get_appointments():
+    with app.app_context():
+        all_appts = Appointment.query.all()
+        result = []
+        for appt in all_appts:
+            result.append({
+                'id': appt.id,
+                'datetime': appt.datetime.strftime("%Y-%m-%d %H:%M"),
+                'description': appt.description,
+                'notified': appt.notified
+            })
+        return jsonify(result)
+
+@app.route('/appointment/<int:reminder_id>/notified', methods=['POST'])
+def mark_as_notified(reminder_id):
+    with app.app_context():
+        appt = Appointment.query.get(reminder_id)
+        if appt:
+            appt.notified = True
+            db.session.commit()
+            return jsonify({"status": "ok"})
+        else:
+            return jsonify({"status": "not found"}), 404
+
+
+# Thread nền kiểm tra nhắc nhở
+def check_appointments():
+    with app.app_context():
+        while True:
+            now = datetime.now()
+            upcoming = Appointment.query.filter(
+                Appointment.datetime <= now,
+                Appointment.notified == False
+            ).all()
+
+            for appt in upcoming:
+                # Xử lý thông báo (ở đây tạm in ra console, bạn có thể nâng cấp UI để thông báo popup)
+                print(f"🔔 Nhắc nhở: {appt.description} lúc {appt.datetime}")
+
+                # Đánh dấu đã thông báo
+                appt.notified = True
+                db.session.commit()
+
+            time.sleep(60)  # Kiểm tra mỗi 60 giây
+
+# Khởi chạy thread check nhắc nhở nền
+threading.Thread(target=check_appointments, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(debug=True)
