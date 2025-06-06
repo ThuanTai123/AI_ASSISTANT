@@ -1,0 +1,16 @@
+CLone dự án về rồi tạo file .env ở folder backend
+Paste:OPENROUTER_API_KEY=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
+(Vì có key API nên git không cho push lên)
+-->Không commit file .env nhưng vẫn phải giữ lại file đó để dễ chạy(dùng echo "backend/.env" >> .gitignore)
+
+Chạy dự án:
+lần lượt các dòng:
+python -m venv venv (tạo môi trường ảo)
+.\venv\Scripts\Activate.ps1 (kích hoạt môi trường ảo)
+cd frontend 
+npm run dev (chạy frontend)
+
+Tạo terminal mới và chạy .\venv\Scripts\Activate.ps1
+cd backend 
+python main.py (chạy backend)
+
